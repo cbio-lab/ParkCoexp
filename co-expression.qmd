@@ -1,0 +1,2038 @@
+---
+format: html
+editor: source
+---
+
+```{r}
+#| include: false
+library(decoupleR)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(pheatmap)
+library(vegan)
+library(pairwiseAdonis)
+library(DESeq2)
+library(limma)
+library(BioNERO)
+library(factoextra)
+library(ggpubr)
+library(ggdist)
+library(multcomp)
+library(RColorBrewer)
+library(DT)
+library(downloadthis)
+
+mypal <- brewer.pal(8, "Set1")
+
+set.seed(666)
+```
+
+```{r}
+#| include: false
+ensbl2geneid <- read.csv("data/ensbl2geneid.tsv", sep = "\t", header = TRUE)
+
+meta_data <- read.csv("data/metadata.tsv", sep = "\t") %>%
+	filter(Ergicity == "DA") %>%
+	dplyr::rename(sampleid = 1) %>%
+	dplyr::mutate(
+		replicate = factor(Tech.rep),
+		place = factor(Cells.Msc.SPb),
+		pict.name = str_remove(pict.name, "_(1|2|3)$"),
+		mutation = factor(pict.name),
+		condition = factor(Health.PD),
+		File = paste0(sampleid, ".counts")
+	) %>%
+	relocate(File, .after = sampleid) %>%
+	dplyr::select(sampleid, File, replicate, place, mutation, condition, reprogramming, gender)
+
+reads.counts <- read.csv("data/counts.tsv", sep = "\t") %>%
+	mutate(
+		sampleid = str_remove(sampleid, "\\.txt$"),
+		sampleid = str_replace(sampleid, "_1A", "-1A")
+	) %>%
+	dplyr::rename(`%_filt` = 4) %>%
+	inner_join(meta_data, by = "sampleid") %>%
+	dplyr::select(-File, -condition)
+
+ddsHTSeq <- DESeqDataSetFromHTSeqCount(
+	sampleTable = meta_data,
+	directory = "data/htseq/",
+	design = ~ place + replicate + condition
+)
+
+rownames(ddsHTSeq) <- str_split(rownames(ddsHTSeq), "\\.") %>% 
+	sapply(`[`, 1)
+
+min_counts <- 10
+min_prop_samples <- 0.3
+
+keep <- rowSums(counts(ddsHTSeq) >= min_counts) >= ncol(ddsHTSeq) * min_prop_samples
+ddsHTSeq <- ddsHTSeq[keep, ]
+```
+
+# Co‑expression analysis workflow
+```{mermaid}
+flowchart LR
+    A[("Raw reads")] --> B{"fastp"}
+    B --> C{"FastQC"} & D{"STAR"}
+    C --> E{"MultiQC"}
+    D --> F{"HTSeq"}
+    F --> G[("Count table")]
+    
+    G --> H{"BioNERO"}
+    H --> I{"STRING"}
+    I --> J["GSEA"]
+    
+    H --> K{"WebGestalt"}
+    
+    G --> L{"PROGENy"}
+    
+    H --> L
+    
+    G --> N["PCA & batch correction"]
+```
+
+<p style="text-align: justify;">
+The diagram below summarises the main steps of our co‑expression analysis. Raw RNA‑seq reads are pre‑processed with fastp for quality trimming, then assessed with FastQC and MultiQC. Clean reads are aligned to the human genome using STAR, and gene‑wise counts are obtained with HTSeq. The resulting count table serves as the central hub for several interconnected tasks: principal component analysis (PCA) after variance‑stabilising transformation and batch correction; construction of weighted gene co‑expression networks with BioNERO, from which modules are extracted and further explored via STRING (protein‑protein interaction) followed by GSEA; over‑representation analysis using WebGestalt on the same modules; and pathway activity inference with PROGENy. Notably, PROGENy also receives input directly from the BioNERO network, enabling cross‑validation between network topology and signalling activity. This multi‑layered strategy allows us to link co‑expression modules to experimental variables, differentiation sites, and signalling pathway activities, turning raw counts into a coherent biological interpretation.
+<p>
+
+# Batch effect correction and quality control
+<p style="text-align: justify;">
+Before constructing co‑expression networks, we applied variance‑stabilising transformation (VST) to the raw count data to homogenise the variance across the expression range. To remove unwanted variation due to the differentiation site (Moscow versus St. Petersburg), we used removeBatchEffect on the VST‑transformed matrix. The effectiveness of this correction was assessed by principal component analysis (PCA): the resulting plot shows samples coloured by differentiation place and shaped by disease status, indicating successful mitigation of batch effects while preserving biological variation. The proportion of variance explained by each principal component is visualised in a scree plot. Finally, we performed a permutational multivariate analysis of variance (PERMANOVA) to formally test the contribution of place, replicate, condition, reprogramming status, and gender to the overall expression variability. This multi‑step quality control ensures that subsequent network inference reflects genuine biological signals rather than technical artefacts.
+<p>
+
+```{r}
+#| include: false
+vsd <- vst(ddsHTSeq, blind = F)
+mat <- removeBatchEffect(assay(vsd), batch = meta_data$place)
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+PCA_vst <- prcomp(t(mat))
+PCA_vst.points <- as.data.frame(PCA_vst$x)
+PCA_vst.points <- merge(meta_data, cbind(rownames(PCA_vst.points), PCA_vst.points), by = 1)[-2]
+
+PCA_vst_plot <- ggplot(PCA_vst.points, aes(PC1, PC2, col = place, shape = condition))+
+      geom_point(size = 2.75)+
+      theme_bw()+
+      theme(legend.position = "right")+
+      scale_color_brewer(palette = "Set1")+
+      xlab("PC1")+
+      ylab("PC2")
+
+prop_vst_plot <- fviz_eig(PCA_vst, col.var="blue") + ggtitle("Proportion of variance")
+```
+
+```{r fig.height=4, fig.width=5}
+#| echo: false
+#| message: false
+#| warning: false
+download_this(
+      PCA_vst_plot,
+      output_name = "PCA_vst_plot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.height=4, fig.width=5}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 1. Principal component analysis of VST‑transformed and batch‑corrected expression data."
+PCA_vst_plot
+```
+
+```{r fig.height=4, fig.width=5}
+#| echo: false
+#| message: false
+#| warning: false
+download_this(
+      prop_vst_plot,
+      output_name = "prop_vst_plot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.height=4, fig.width=5}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 2. Proportion of variance explained by each principal component."
+prop_vst_plot
+```
+
+```{r}
+#| echo: false
+PERMANOVA_genes <- adonis2(t(mat) ~  place + replicate + condition + reprogramming + gender, data = meta_data, permutations = 9999, by = "margin")
+PERMANOVA_genes
+```
+
+# Weighted gene co‑expression network construction
+<p style="text-align: justify;">
+After batch correction, we built weighted gene co‑expression networks using the BioNERO pipeline. The expression matrix was first pre‑processed by filtering low‑abundance genes and selecting the top 3,000 most variable genes to reduce noise. We then fitted a signed hybrid network using both Pearson and Spearman correlations to assess the robustness of the results under different similarity metrics. For each correlation type, the optimal soft‑thresholding power was determined by scale‑free topology fit. The resulting networks were subjected to module detection by dynamic tree cutting, producing dendrograms that visualise the hierarchical clustering of genes and the assignment of colour‑coded modules. The distribution of gene counts per module is shown, as well as pairwise correlations among module eigengenes to reveal higher‑order relationships between modules. Finally, we calculated the association between each module eigengene and the experimental variables (mutation status, disease, place, etc.) to identify modules that are most relevant to our biological questions. This step‑by‑step construction provides a solid foundation for subsequent hub gene analysis, functional enrichment, and integration with pathway activity data.
+<p>
+
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+final_exp <- exp_preprocess(
+      mat, min_exp = 10, variance_filter = TRUE, n = 3000
+)
+
+sft.p <- SFT_fit(final_exp, net_type = "signed hybrid", cor_method = "pearson")
+power.p <- sft.p$power
+
+net.p <- exp2gcn(
+      final_exp, net_type = "signed hybrid", SFTpower = power.p, 
+      cor_method = "pearson"
+)
+
+plot_dendro.p <- plot_dendro_and_colors(net.p)
+plot_cor_module.p <- plot_eigengene_network(net.p)
+plot_ngenes.p <- plot_ngenes_per_module(net.p)
+
+# pdf("figures/plot_cor_module.p.pdf", width = 8, height = 7)
+# plot_cor_module.p
+# dev.off()
+
+sft.s <- SFT_fit(final_exp, net_type = "signed hybrid", cor_method = "spearman")
+power.s <- sft.s$power
+
+net.s <- exp2gcn(
+      final_exp, net_type = "signed hybrid", SFTpower = power.s, 
+      cor_method = "spearman"
+)
+
+plot_dendro.s <- plot_dendro_and_colors(net.s)
+plot_cor_module.s <- plot_eigengene_network(net.s)
+plot_ngenes.s <- plot_ngenes_per_module(net.s)
+
+# pdf("figures/plot_cor_module.s.pdf", width = 8, height = 7)
+# plot_cor_module.s
+# dev.off()
+```
+
+```{r}
+#| message: true
+#| warning: true
+#| include: false
+dfg <- meta_data[c(1,4:6)]
+rownames(dfg) <- dfg$sampleid
+dfg <- dfg[-1]
+
+MEtrait.p <- module_trait_cor(exp = final_exp, MEs = net.p$MEs, metadata = dfg)
+module_trait_cor_plot.p <- plot_module_trait_cor(MEtrait.p)
+
+# pdf("figures/module_trait_cor_plot.p.pdf", width = 7, height = 8)
+# module_trait_cor_plot.p
+# dev.off()
+
+MEtrait.s <- module_trait_cor(exp = final_exp, MEs = net.s$MEs, metadata = dfg)
+module_trait_cor_plot.s <- plot_module_trait_cor(MEtrait.s)
+
+# pdf("figures/module_trait_cor_plot.s.pdf", width = 7, height = 8)
+# module_trait_cor_plot.s
+# dev.off()
+```
+
+## Pearson correlation‑based network
+```{r fig.width=8, fig.height=5}
+#| echo: false
+download_this(
+      plot_dendro.p,
+      output_name = "plot_dendro.p",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=8, fig.height=5}
+#| echo: false
+#| fig-cap: "Figure 3. Hierarchical clustering dendrogram of co‑expression modules (Pearson correlation)."
+plot_dendro.p
+```
+
+```{r fig.width=8, fig.height=6}
+#| echo: false
+download_this(
+      plot_ngenes.p,
+      output_name = "plot_ngenes.p",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=8, fig.height=6}
+#| echo: false
+#| fig-cap: "Figure 4. Distribution of gene counts across co‑expression modules (Pearson)."
+plot_ngenes.p
+```
+
+[Figure 5](figures/plot_cor_module.p.pdf)
+
+```{r fig.width=8, fig.height=7}
+#| echo: false
+#| fig-cap: "Figure 5. Pairwise Spearman correlation matrix of module eigengenes (Pearson‑based network)."
+plot_cor_module.p
+```
+
+[Figure 6](figures/module_trait_cor_plot.p.pdf)
+
+```{r fig.width=7, fig.height=8}
+#| echo: false
+#| fig-cap: "Figure 6. Module–trait associations: correlation between module eigengenes and experimental variables (Pearson)."
+module_trait_cor_plot.p
+```
+
+## Spearman correlation‑based network
+```{r fig.width=8, fig.height=5}
+#| echo: false
+download_this(
+      plot_dendro.s,
+      output_name = "plot_dendro.s",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=8, fig.height=5}
+#| echo: false
+#| fig-cap: "Figure 7. Hierarchical clustering dendrogram of co‑expression modules (Spearman correlation)."
+plot_dendro.s
+```
+
+```{r fig.width=8, fig.height=6}
+#| echo: false
+download_this(
+      plot_ngenes.s,
+      output_name = "plot_ngenes.s",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=8, fig.height=6}
+#| echo: false
+#| fig-cap: "Figure 8. Distribution of gene counts across co‑expression modules (Spearman)."
+plot_ngenes.s
+```
+
+[Figure 9](figures/plot_cor_module.s.pdf)
+
+```{r fig.width=8, fig.height=7}
+#| echo: false
+#| fig-cap: "Figure 9. Pairwise Spearman correlation matrix of module eigengenes (Spearman‑based network)."
+plot_cor_module.s
+```
+
+[Figure 10](figures/module_trait_cor_plot.s.pdf)
+
+```{r fig.width=7, fig.height=8}
+#| echo: false
+#| fig-cap: "Figure 10. Module–trait associations: correlation between module eigengenes and experimental variables (Spearman)."
+module_trait_cor_plot.s
+```
+
+# Module eigengene analysis across experimental groups
+<p style="text-align: justify;">
+To characterise the biological relevance of the identified co‑expression modules, we examined the distribution of module eigengenes – the first principal component of each module – across experimental groups. For the Pearson‑based network, we focused on three modules (skyblue3, black, and grey) that showed strong associations with Parkinson’s disease‑related traits in the module–trait correlation analysis. Their eigengene values were visualised using half‑eye density plots (showing the full distribution shape together with median and quartile intervals) to compare mutation status and disease condition (Parkinson's disease versus control). Statistical significance of differences between groups was assessed by generalised linear models followed by Tukey's post‑hoc tests with false discovery rate correction. The same procedure was applied to the Spearman‑based network, where only the skyblue3 module exhibited a clear link to disease status. To obtain an integrated view, we combined the three relevant Pearson module eigengenes (skyblue3, black, grey) with the Spearman skyblue3 eigengene into a single matrix, performed principal component analysis, and visualised the resulting PC1 and PC2 scores by mutation status and differentiation place. PERMANOVA and pairwise adonis tests confirmed that the combined eigengene space significantly separates mutation groups, while homogeneity of dispersions was verified to ensure the robustness of the multivariate comparisons. This multi‑level eigengene analysis bridges the gap between network topology and sample phenotypes, highlighting modules that capture genuine disease‑associated transcriptional variation.
+<p>
+
+```{r}
+#| include: false
+ME.pearson <- as.data.frame(net.p$MEs)
+ME.spearman <- as.data.frame(net.s$MEs)
+
+ME.pearson.m <- merge(meta_data, cbind(rownames(ME.pearson), ME.pearson), by = 1)
+ME.spearman.m <- merge(meta_data, cbind(rownames(ME.spearman), ME.spearman), by = 1)
+
+skyblue3.p.mut <- ggplot(ME.pearson.m, aes(MEskyblue3, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Mutation")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+skyblue3.p.dis <- ggplot(ME.pearson.m, aes(MEskyblue3, condition, col = condition))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Disease")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+black.p.mut <- ggplot(ME.pearson.m, aes(MEblack, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Mutation")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+black.p.dis <- ggplot(ME.pearson.m, aes(MEblack, condition, col = condition))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Disease")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+grey.p.mut <- ggplot(ME.pearson.m, aes(MEgrey, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Mutation")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+grey.p.dis <- ggplot(ME.pearson.m, aes(MEgrey, condition, col = condition))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Disease")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+skyblue3.s.mut <- ggplot(ME.spearman.m, aes(MEskyblue3, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Mutation")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+skyblue3.s.dis <- ggplot(ME.spearman.m, aes(MEskyblue3, condition, col = condition))+
+      stat_halfeye()+
+      xlab("Module eigengene")+
+      ylab("Disease")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+```
+
+## Skyblue3 module (Pearson network)
+### By mutation status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      skyblue3.p.mut,
+      output_name = "skyblue3.p.mut",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 11. Distribution of skyblue3 module eigengene scores by mutation status (Pearson network)."
+skyblue3.p.mut
+```
+
+```{r}
+#| echo: false
+glm_skyblue3_p <- glm(MEskyblue3 ~ mutation, data = ME.pearson.m)
+
+summary(glht(glm_skyblue3_p, linfct = mcp(mutation = "Tukey")), test = adjusted("fdr"))
+```
+
+### By disease status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      skyblue3.p.dis,
+      output_name = "skyblue3.p.dis",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 12. Distribution of skyblue3 module eigengene scores by disease status (Pearson network)."
+skyblue3.p.dis
+```
+
+```{r}
+#| echo: false
+glm_skyblue3_c <- glm(MEskyblue3 ~ condition, data = ME.pearson.m)
+
+summary(glht(glm_skyblue3_c, linfct = mcp(condition = "Tukey")), test = adjusted("fdr"))
+```
+
+## Black module (Pearson network)
+### By mutation status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      black.p.mut,
+      output_name = "black.p.mut",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 13. Distribution of black module eigengene scores by mutation status (Pearson network)."
+black.p.mut
+```
+
+```{r}
+#| echo: false
+glm_black_p <- glm(MEblack ~ mutation, data = ME.pearson.m)
+
+summary(glht(glm_black_p, linfct = mcp(mutation = "Tukey")), test = adjusted("fdr"))
+```
+
+### By disease status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      black.p.dis,
+      output_name = "black.p.dis",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 14. Distribution of black module eigengene scores by disease status (Pearson network)."
+black.p.dis
+```
+
+```{r}
+#| echo: false
+glm_black_c <- glm(MEblack ~ condition, data = ME.pearson.m)
+
+summary(glht(glm_black_c, linfct = mcp(condition = "Tukey")), test = adjusted("fdr"))
+```
+
+## Grey module (Pearson network)
+### By mutation status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      grey.p.mut,
+      output_name = "grey.p.mut",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 15. Distribution of grey module eigengene scores by mutation status (Pearson network)."
+grey.p.mut
+```
+
+```{r}
+#| echo: false
+glm_grey_p <- glm(MEgrey ~ mutation, data = ME.pearson.m)
+
+summary(glht(glm_grey_p, linfct = mcp(mutation = "Tukey")), test = adjusted("fdr"))
+```
+
+### By disease status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      grey.p.dis,
+      output_name = "grey.p.dis",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 16. Distribution of grey module eigengene scores by disease status (Pearson network)."
+grey.p.dis
+```
+
+```{r}
+#| echo: false
+glm_grey_c <- glm(MEgrey ~ condition, data = ME.pearson.m)
+
+summary(glht(glm_grey_c, linfct = mcp(condition = "Tukey")), test = adjusted("fdr"))
+```
+
+## Skyblue3 module (Spearman network)
+### By mutation status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      skyblue3.s.mut,
+      output_name = "skyblue3.s.mut",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 17. Distribution of skyblue3 module eigengene scores by mutation status (Spearman network)."
+skyblue3.s.mut
+```
+
+```{r}
+#| echo: false
+glm_skyblue3_p_sp <- glm(MEskyblue3 ~ mutation, data = ME.spearman.m)
+
+summary(glht(glm_skyblue3_p_sp, linfct = mcp(mutation = "Tukey")), test = adjusted("fdr"))
+```
+
+### By disease status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      skyblue3.s.dis,
+      output_name = "skyblue3.s.mut",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 18. Distribution of skyblue3 module eigengene scores by disease status (Spearman network)."
+skyblue3.s.dis
+```
+
+```{r}
+#| echo: false
+glm_skyblue3_s_sp <- glm(MEskyblue3 ~ condition, data = ME.spearman.m)
+
+summary(glht(glm_skyblue3_s_sp, linfct = mcp(condition = "Tukey")), test = adjusted("fdr"))
+```
+
+## Integrated PCA of selected module eigengenes
+```{r}
+#| include: false
+ME.select <- cbind(ME.pearson[c("MEskyblue3", "MEblack", "MEgrey")], ME.spearman["MEskyblue3"])
+
+PCA.ME <- prcomp(ME.select)
+PCA.ME.points <- as.data.frame(PCA.ME$x)
+PCA.ME.points <- merge(meta_data, cbind(rownames(PCA.ME.points), PCA.ME.points), by = 1)[-2]
+
+PCA.ME_plot <- ggplot(PCA.ME.points, aes(PC1, PC2, col = mutation, shape = place))+
+    geom_point(size = 2.75)+
+    theme_bw()+
+    theme(legend.position = "right")+
+    scale_color_brewer(palette = "Set1")+
+    xlab("PC1")+
+    ylab("PC2")
+
+prop_plot_ME <- fviz_eig(PCA.ME, col.var="blue") + ggtitle("Proportion of explained variance")
+
+PC1.mut <- ggplot(PCA.ME.points, aes(PC1, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("PC1")+
+      ylab("Mutation")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+PC1.dis <- ggplot(PCA.ME.points, aes(PC1, condition, col = condition))+
+      stat_halfeye()+
+      xlab("PC1")+
+      ylab("Disease")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+```
+
+```{r}
+#| echo: false
+download_this(
+      PCA.ME_plot,
+      output_name = "PCA_plot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 19. Principal component analysis of selected module eigengenes."
+PCA.ME_plot
+```
+
+```{r fig.width=5, fig.height=4}
+#| echo: false
+download_this(
+      prop_plot_ME,
+      output_name = "prop_plot_ME",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 20. Variance explained by principal components derived from module eigengenes."
+prop_plot_ME
+```
+
+#### PERMANOVA
+```{r}
+#| echo: false
+PERMANOVA_modules <- adonis2(ME.select ~  place + mutation, data = meta_data[meta_data$sampleid %in% rownames(ME.select),], permutations = 9999, by = "margin", method = "euclidean")
+
+pairwise_mutation <- pairwise.adonis2(ME.select ~  mutation, data = meta_data[meta_data$sampleid %in% rownames(ME.select),], permutations = 9999, 
+by = "margin", method = "euclidean")
+
+pairwise_condition <- pairwise.adonis2(ME.select ~  condition, data = meta_data[meta_data$sampleid %in% rownames(ME.select),], permutations = 9999, by = "margin", method = "euclidean")
+```
+
+```{r}
+#| echo: false
+print(PERMANOVA_modules)
+```
+
+#### Pairwise PERMANOVA - mutation
+```{r}
+#| echo: false
+print(pairwise_mutation)
+```
+
+#### Pairwise PERMANOVA - condition
+```{r}
+#| echo: false
+print(pairwise_condition)
+```
+
+#### Homogeneity of groups dispersions - mutation
+```{r}
+#| echo: false
+disp.m <- betadisper(vegdist(ME.select, method = "euclidean"), meta_data$mutation[meta_data$sampleid %in% rownames(ME.select)])
+anova(disp.m)
+```
+
+```{r}
+#| echo: false
+plot(disp.m)
+```
+
+```{r}
+#| echo: false
+TukeyHSD(disp.m)
+```
+
+#### Homogeneity of groups dispersions - condition
+```{r}
+#| echo: false
+disp.c <- betadisper(vegdist(ME.select, method = "euclidean"), meta_data$condition[meta_data$sampleid %in% rownames(ME.select)])
+anova(disp.c)
+```
+
+```{r}
+#| echo: false
+plot(disp.c)
+```
+
+```{r}
+#| echo: false
+TukeyHSD(disp.c)
+```
+
+#### PC1 scores by mutation status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      PC1.mut,
+      output_name = "PC1.mut",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 21. First principal component scores of module eigengenes by mutation status."
+PC1.mut
+```
+
+```{r}
+#| echo: false
+glm_PC1_m <- glm(PC1 ~ mutation, data = PCA.ME.points)
+summary(glht(glm_PC1_m, linfct = mcp(mutation = "Tukey")), test = adjusted("fdr"))
+```
+
+#### PC1 scores by disease status
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      PC1.dis,
+      output_name = "PC1.dis",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 22. First principal component scores of module eigengenes by disease status."
+PC1.dis
+```
+
+```{r}
+#| echo: false
+glm_PC1_c <- glm(PC1 ~ condition, data = PCA.ME.points)
+summary(glht(glm_PC1_c, linfct = mcp(condition = "Tukey")), test = adjusted("fdr"))
+```
+
+# Co‑expression modules associated with Parkinson’s disease
+<p style="text-align: justify;">
+From the module–trait correlation analysis we identified three co‑expression modules (skyblue3, black, and grey) in the Pearson‑based network that showed significant associations with Parkinson’s disease status and mutation type. For the Spearman‑based network, only the skyblue3 module displayed a clear link to disease‑related traits. The complete lists of genes belonging to these modules are provided as interactive tables, together with the corresponding hub genes – the most highly connected genes within each module – which likely play central functional roles. To visualise the internal organisation of these modules, we constructed gene co‑expression networks using the optimal soft‑thresholding power and a correlation cutoff of 0.6. The resulting graphs show nodes (genes) coloured by module membership, with hub genes highlighted, and edges representing significant co‑expression relationships. These network plots reveal densely connected cores and peripheral nodes, providing a clear visual representation of each module’s architecture. Finally, we performed over‑representation analysis using WebGestalt on the gene sets of each PD‑linked module. The enriched Gene Ontology terms and signalling pathways are presented in separate tables, allowing a functional interpretation of each module. Together, this multi‑faceted characterisation – from gene lists and hubs to network topology and functional annotation – pinpoints the biological processes that may underlie the observed transcriptional differences between mutation groups and disease conditions.
+<p>
+
+## Pearson‑based modules (skyblue3, black, grey)
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+cor_sets <- c("skyblue3", "black", "grey")
+
+selected_modules.p <- net.p$genes_and_modules %>%
+	filter(Modules %in% cor_sets) %>%
+	arrange(desc(Modules))
+
+selected_modules_add.p <- ensbl2geneid %>%
+	inner_join(selected_modules.p, by = c("gene_id" = "Genes")) %>%
+	arrange(desc(Modules)) %>%
+	dplyr::rename(module = Modules)
+```
+
+```{r}
+#| echo: false
+rownames(selected_modules_add.p) <- 1:nrow(selected_modules_add.p)
+
+datatable(selected_modules_add.p,
+          caption = "Table 1. Genes assigned to co‑expression modules associated with Parkinson’s disease (Pearson correlation).",
+          style = "bootstrap5",
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+## Spearman‑based module (skyblue3)
+```{r}
+#| include: false
+selected_modules.s <- net.s$genes_and_modules %>%
+	filter(Modules %in% cor_sets[1]) %>%
+	arrange(desc(Modules))
+
+selected_modules_add.s <- ensbl2geneid %>%
+	inner_join(selected_modules.s, by = c("gene_id" = "Genes")) %>%
+	arrange(desc(Modules)) %>%
+	dplyr::rename(module = Modules)
+```
+
+```{r}
+#| echo: false
+rownames(selected_modules_add.s) <- 1:nrow(selected_modules_add.s)
+
+datatable(selected_modules_add.s,
+          caption = "Table 2. Genes assigned to co‑expression modules associated with Parkinson’s disease (Spearman correlation).",
+          style = "bootstrap5",
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+## Hub gene identification and network visualization
+### Pearson network hubs
+```{r}
+#| echo: false
+hubs.p <- get_hubs_gcn(final_exp, net.p)
+
+selected_hubs.p <- hubs.p %>%
+	filter(Module %in% cor_sets) %>%
+	arrange(desc(Module))
+
+selected_hubs_add.p <- ensbl2geneid %>%
+	inner_join(selected_hubs.p, by = c("gene_id" = "Gene")) %>%
+	arrange(desc(Module))
+```
+
+```{r}
+#| echo: false
+rownames(selected_hubs_add.p) <- 1:nrow(selected_hubs_add.p)
+
+datatable(selected_hubs_add.p, 
+          caption = "Table 3. Hub genes of PD‑associated co‑expression modules (Pearson network).",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+### Spearman network hubs
+```{r}
+#| echo: false
+hubs.s <- get_hubs_gcn(final_exp, net.s)
+
+selected_hubs.s <- hubs.s %>%
+	filter(Module %in% cor_sets[1]) %>%
+	arrange(desc(Module))
+
+selected_hubs_add.s <- ensbl2geneid %>%
+	inner_join(selected_hubs.s, by = c("gene_id" = "Gene")) %>%
+	arrange(desc(Module))
+```
+
+```{r}
+#| echo: false
+rownames(selected_hubs_add.s) <- 1:nrow(selected_hubs_add.s)
+
+datatable(selected_hubs_add.s, 
+          caption = "Table 4. Hub genes of PD‑associated co‑expression modules (Spearman network).",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+## Combined network plots
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+make_network_plot <- function(net_obj, module_name, plot_title, hubs_obj, color_by = "module") {
+	edge_list <- get_edge_list(
+		net = net_obj,
+		module = module_name,
+		filter = TRUE,
+		method = "optimalSFT",
+		r_optimal_test = 0.6
+	)
+
+	plot_gcn(
+		edgelist_gcn = edge_list,
+		net = net_obj,
+		color_by = color_by,
+		hubs = hubs_obj,
+		top_n_hubs = 0
+	) + ggtitle(plot_title)
+}
+
+net_plot_1 <- make_network_plot(net.p, cor_sets[1], "skyblue3", hubs.p)
+net_plot_2 <- make_network_plot(net.p, cor_sets[2], "black", hubs.p)
+net_plot_3 <- make_network_plot(net.p, cor_sets[3], "grey", hubs.p, color_by = "grey30")
+net_plot_4 <- make_network_plot(net.s, cor_sets[1], "skyblue3 (Spearman)", hubs.s)
+
+net_plot <- ggarrange(net_plot_1, net_plot_2, net_plot_3, net_plot_4)
+```
+
+```{r fig.width=12, fig.height=12}
+#| echo: false
+#| message: false
+#| warning: false
+download_this(
+      net_plot,
+      output_name = "net_plot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=12, fig.height=12}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 23. Gene co‑expression networks for modules associated with mutation and disease groups."
+net_plot
+```
+
+## Functional enrichment analysis (WebGestalt)
+
+### Skyblue3 module (Pearson)
+
+[Table 6 - WebGestalt results](data/webgestalt/skyblue3-pearson_wg.html)
+
+```{r}
+#| echo: false
+skyblue3_pearson_wg <- read.csv("data/webgestalt/skyblue3-pearson_wg.txt", sep = "\t")
+
+datatable(skyblue3_pearson_wg, 
+          caption = "Table 5. WebGestalt over‑representation analysis results: skyblue3 module (Pearson) – enriched pathways and GO terms.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Black module
+
+[Table 7 - WebGestalt results](data/webgestalt/black_wg.html)
+
+```{r}
+#| echo: false
+black_wg <- read.csv("data/webgestalt/black_wg.txt", sep = "\t")
+
+datatable(black_wg, 
+          caption = "Table 6. WebGestalt over‑representation analysis results: black module – enriched pathways and GO terms.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Grey module
+
+[Table 8 - WebGestalt results](data/webgestalt/grey_wg.html)
+
+```{r}
+#| echo: false
+grey_wg <- read.csv("data/webgestalt/grey_wg.txt", sep = "\t")
+
+datatable(grey_wg, 
+          caption = "Table 7. WebGestalt over‑representation analysis results: grey module – enriched pathways and GO terms.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Skyblue3 module (Spearman)
+
+[Table 9 - WebGestalt results](data/webgestalt/skyblue3-spearman_wg.html)
+
+```{r}
+#| echo: false
+skyblue3_spearman_wg <- read.csv("data/webgestalt/skyblue3-spearman_wg.txt", sep = "\t")
+
+datatable(skyblue3_spearman_wg, 
+          caption = "Table 8. WebGestalt over‑representation analysis results: skyblue3 module (Spearman) – enriched pathways and GO terms.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+# Co‑expression modules associated with differentiation site
+<p style="text-align: justify;">
+Beyond the modules associated with Parkinson's disease, we also explored co‑expression modules that differed between the two differentiation sites: Moscow and St. Petersburg. In the Pearson‑based network, six modules (darkturquoise, grey60, violet, cyan, lightcyan1, and orangered4) showed significant association with the place variable. For the Spearman‑based network, four modules (lightsteelblue1, grey, midnightblue, and orange) were linked to differentiation site. The full gene lists of these modules are provided as interactive tables, along with their respective hub genes – the most highly connected genes within each module – which may drive the transcriptional differences between the two locations. To visualise the internal structure of these place‑associated modules, we constructed gene co‑expression networks for each module, using the same parameters as for the PD‑linked modules. The resulting network plots reveal module‑specific connectivity patterns and highlight central hub genes. Finally, we performed over‑representation analysis with WebGestalt on each place‑associated module. The enriched pathways and Gene Ontology terms are presented in separate tables, separately for modules enriched in Moscow‑derived samples and for those enriched in St. Petersburg‑derived samples. This dissection of place‑specific co‑expression modules helps to disentangle the biological processes that are influenced by the differentiation environment, independent of the disease status or mutation background.
+<p>
+
+## Pearson‑based modules (Moscow‑ vs St. Petersburg‑associated)
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+cor_sets_pearson <- c("darkturquoise", "grey60", "violet", "cyan", "lightcyan1", "orangered4")
+
+place_modules.p <- net.p$genes_and_modules %>%
+	filter(Modules %in% cor_sets_pearson) %>%
+	arrange(desc(Modules))
+
+place_modules_add.p <- ensbl2geneid %>%
+	inner_join(place_modules.p, by = c("gene_id" = "Genes")) %>%
+	arrange(desc(Modules)) %>%
+	dplyr::rename(module = Modules)
+```
+
+```{r}
+#| echo: false
+rownames(place_modules_add.p) <- 1:nrow(place_modules_add.p)
+
+datatable(place_modules_add.p,
+          caption = "Table 9. Genes of co‑expression modules associated with differentiation site (Moscow vs St. Petersburg) – Pearson network.",
+          style = "bootstrap5",
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+## Spearman‑based modules
+```{r}
+#| include: false
+cor_sets_spearman <- c("lightsteelblue1", "grey", "midnightblue", "orange")
+
+place_modules.s <- net.s$genes_and_modules %>%
+	filter(Modules %in% cor_sets_spearman) %>%
+	arrange(desc(Modules))
+
+place_modules_add.s <- ensbl2geneid %>%
+	inner_join(place_modules.s, by = c("gene_id" = "Genes")) %>%
+	arrange(desc(Modules)) %>%
+	dplyr::rename(module = Modules)
+```
+
+```{r}
+#| echo: false
+rownames(place_modules_add.s) <- 1:nrow(place_modules_add.s)
+
+datatable(place_modules_add.s,
+          caption = "Table 10. Genes of co‑expression modules associated with differentiation site (Moscow vs St. Petersburg) – Spearman network.",
+          style = "bootstrap5",
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+## Hub genes
+## Pearson network hubs
+```{r}
+#| echo: false
+place_hubs.p <- hubs.p %>%
+	filter(Module %in% cor_sets_pearson) %>%
+	arrange(desc(Module))
+
+place_hubs_add.p <- ensbl2geneid %>%
+	inner_join(place_hubs.p, by = c("gene_id" = "Gene")) %>%
+	arrange(desc(Module))
+```
+
+```{r}
+#| echo: false
+rownames(place_hubs_add.p) <- 1:nrow(place_hubs_add.p)
+
+datatable(place_hubs.p, 
+          caption = "Table 11. Hub genes of differentiation‑site‑associated modules (Pearson network).",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+## Spearman network hubs
+```{r}
+#| echo: false
+place_hubs.s <- hubs.s %>%
+	filter(Module %in% cor_sets_spearman) %>%
+	arrange(desc(Module))
+
+place_hubs_add.s <- ensbl2geneid %>%
+	inner_join(place_hubs.s, by = c("gene_id" = "Gene")) %>%
+	arrange(desc(Module))
+```
+
+```{r}
+#| echo: false
+rownames(place_hubs_add.s) <- 1:nrow(place_hubs_add.s)
+
+datatable(place_hubs_add.s, 
+          caption = "Table 12. Hub genes of differentiation‑site‑associated modules (Spearman network).",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip',
+                         buttons = c('csv', 'excel')))
+```
+
+## Network plots of place‑associated modules
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+place_plot_pearson_1 <- make_network_plot(net.p, cor_sets_pearson[1], cor_sets_pearson[1], hubs.p)
+place_plot_pearson_2 <- make_network_plot(net.p, cor_sets_pearson[2], cor_sets_pearson[2], hubs.p)
+place_plot_pearson_3 <- make_network_plot(net.p, cor_sets_pearson[3], cor_sets_pearson[3], hubs.p)
+place_plot_pearson_4 <- make_network_plot(net.p, cor_sets_pearson[4], cor_sets_pearson[4], hubs.p)
+place_plot_pearson_5 <- make_network_plot(net.p, cor_sets_pearson[5], cor_sets_pearson[5], hubs.p)
+place_plot_pearson_6 <- make_network_plot(net.p, cor_sets_pearson[6], cor_sets_pearson[6], hubs.p)
+
+place_plot_pearson <- ggarrange(place_plot_pearson_1, place_plot_pearson_2, place_plot_pearson_3, 
+                                place_plot_pearson_4, place_plot_pearson_5, place_plot_pearson_6)
+
+place_plot_spearman_1 <- make_network_plot(net.s, cor_sets_spearman[1], cor_sets_spearman[1], hubs.s)
+place_plot_spearman_2 <- make_network_plot(net.s, cor_sets_spearman[2], cor_sets_spearman[2], hubs.s)
+place_plot_spearman_3 <- make_network_plot(net.s, cor_sets_spearman[3], cor_sets_spearman[3], hubs.s)
+place_plot_spearman_4 <- make_network_plot(net.s, cor_sets_spearman[4], cor_sets_spearman[4], hubs.s)
+
+place_plot_spearman <- ggarrange(place_plot_spearman_1, place_plot_spearman_2, 
+                                 place_plot_spearman_3, place_plot_spearman_4)
+```
+
+```{r fig.width=15, fig.height=10}
+#| echo: false
+#| message: false
+#| warning: false
+download_this(
+      place_plot_pearson,
+      output_name = "place_plot_pearson",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=15, fig.height=10}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 24. Co‑expression networks of modules associated with differentiation site (Pearson‑based)."
+place_plot_pearson
+```
+
+```{r fig.width=10, fig.height=10}
+#| echo: false
+#| message: false
+#| warning: false
+download_this(
+      place_plot_spearman,
+      output_name = "place_plot_spearman",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=10, fig.height=10}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 25. Co‑expression networks of modules associated with differentiation site (Spearman‑based)."
+place_plot_spearman
+```
+
+## Functional enrichment of place‑associated modules
+
+### Darkturquoise (Pearson, Moscow)
+
+[Table 13 - WebGestalt results](data/webgestalt/pearson/darkturquoise_pearson-msc.html)
+
+```{r}
+#| echo: false
+darkturquoise_pearson_msc <- read.csv("data/webgestalt/pearson/darkturquoise_pearson-msc.txt", sep = "\t")
+
+datatable(darkturquoise_pearson_msc, 
+          caption = "Table 13. WebGestalt ORA: darkturquoise module (Pearson, Moscow) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Grey60 (Pearson, Moscow)
+
+[Table 14 - WebGestalt results](data/webgestalt/pearson/grey60_pearson-msc.html)
+
+```{r}
+#| echo: false
+grey60_pearson_msc <- read.csv("data/webgestalt/pearson/grey60_pearson-msc.txt", sep = "\t")
+
+datatable(grey60_pearson_msc, 
+          caption = "Table 14. WebGestalt ORA: grey60 module (Pearson, Moscow) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Violet (Pearson, Moscow)
+
+[Table 15 - WebGestalt results](data/webgestalt/pearson/violet_pearson-msc.html)
+
+```{r}
+#| echo: false
+violet_pearson_msc <- read.csv("data/webgestalt/pearson/violet_pearson-msc.txt", sep = "\t")
+
+datatable(violet_pearson_msc, 
+          caption = "Table 15. WebGestalt ORA: violet module (Pearson, Moscow) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Lightsteelblue1 (Spearman, Moscow)
+
+[Table 16 - WebGestalt results](data/webgestalt/spearman/lightsteelblue1-spearman-msc.html)
+
+```{r}
+#| echo: false
+lightsteelblue1_spearman_msc <- read.csv("data/webgestalt/spearman/lightsteelblue1-spearman-msc.txt", sep = "\t")
+
+datatable(lightsteelblue1_spearman_msc, 
+          caption = "Table 16. WebGestalt ORA: lightsteelblue1 module (Spearman, Moscow) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Cyan (Pearson, St. Petersburg)
+
+[Table 17 - WebGestalt results](data/webgestalt/pearson/cyan_pearson_spb.html)
+
+```{r}
+#| echo: false
+cyan_pearson_spb <- read.csv("data/webgestalt/pearson/cyan_pearson_spb.txt", sep = "\t")
+
+datatable(cyan_pearson_spb, 
+          caption = "Table 17. WebGestalt ORA: cyan module (Pearson, St. Petersburg) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Lightcyan1 (Pearson, St. Petersburg)
+
+[Table 18 - WebGestalt results](data/webgestalt/pearson/lightcyan1_pearson-spb.html)
+
+```{r}
+#| echo: false
+lightcyan1_pearson_spb <- read.csv("data/webgestalt/pearson/lightcyan1_pearson-spb.txt", sep = "\t")
+
+datatable(lightcyan1_pearson_spb, 
+          caption = "Table 18. WebGestalt ORA: lightcyan1 module (Pearson, St. Petersburg) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Orangered4 (Pearson, St. Petersburg)
+
+[Table 19 - WebGestalt results](data/webgestalt/pearson/orangered4_pearson-spb.html)
+
+```{r}
+#| echo: false
+orangered4_pearson_spb <- read.csv("data/webgestalt/pearson/orangered4_pearson-spb.txt", sep = "\t")
+
+datatable(orangered4_pearson_spb, 
+          caption = "Table 19. WebGestalt ORA: orangered4 module (Pearson, St. Petersburg) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Grey (Spearman, St. Petersburg)
+
+[Table 20 - WebGestalt results](data/webgestalt/spearman/grey-spearman-spb.html)
+
+```{r}
+#| echo: false
+grey_spearman_spb <- read.csv("data/webgestalt/spearman/grey-spearman-spb.txt", sep = "\t")
+
+datatable(grey_spearman_spb, 
+          caption = "Table 20. WebGestalt ORA: grey module (Spearman, St. Petersburg) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Midnightblue (Spearman, St. Petersburg)
+
+[Table 21 - WebGestalt results](data/webgestalt/spearman/midnightblue-spearman-spb.html)
+
+```{r}
+#| echo: false
+midnightblue_spearman_spb <- read.csv("data/webgestalt/spearman/midnightblue-spearman-spb.txt", sep = "\t")
+
+datatable(midnightblue_spearman_spb, 
+          caption = "Table 21. WebGestalt ORA: midnightblue module (Spearman, St. Petersburg) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+### Orange (Spearman, St. Petersburg)
+
+[Table 22 - WebGestalt results](data/webgestalt/spearman/orange-spearman-spb.html)
+
+```{r}
+#| echo: false
+orange_spearman_spb <- read.csv("data/webgestalt/spearman/orange-spearman-spb.txt", sep = "\t")
+
+datatable(orange_spearman_spb, 
+          caption = "Table 22. WebGestalt ORA: orange module (Spearman, St. Petersburg) – enriched pathways.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+# Signalling pathway activity analysis (PROGENy)
+<p style="text-align: justify;">
+To complement the co‑expression network analysis, we inferred the activity of fourteen canonical signalling pathways using the PROGENy resource. Pathway scores were estimated for each sample by applying the multivariate linear model (MLM) implemented in the decoupleR framework, based on the top five hundred most responsive genes per pathway. The resulting activity matrix was first visualised as a Spearman correlation heatmap, revealing clusters of pathways with similar activity patterns across samples. We then asked whether the first principal component of the selected module eigengenes (derived from the combined Pearson and Spearman modules) correlated with pathway activities. A significant positive Spearman correlation was observed between PC1 and TGF‑β pathway activity (ρ = 0.57, FDR‑adjusted p = 0.012), suggesting a link between the co‑expression modules that differentiate mutation groups and this key signalling axis. To formally test which pathways differ by experimental factors, we performed two‑way analysis of variance (ANOVA) with place and mutation as independent variables. Pathways with significant differences after false discovery rate correction were retained, and their activity scores were visualised using half‑eye density plots to compare mutation statuses. Linear models including gender, reprogramming status, and place as covariates were additionally fitted for each significant pathway to assess the robustness of the mutation effect. This integrative pathway analysis bridges the gap between transcriptional co‑expression and upstream signalling regulation, providing a mechanistic interpretation of the module‑level differences observed between experimental groups.
+<p>
+
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+mat_df <- as.data.frame(mat) %>%
+	rownames_to_column("gene_id") %>%
+	inner_join(ensbl2geneid[, c("gene_id", "gene_name")], by = "gene_id") %>%
+	dplyr::select(gene_name, everything(), -gene_id) %>%
+	distinct(gene_name, .keep_all = TRUE) %>%
+	column_to_rownames("gene_name")
+
+net_progeny <- decoupleR::get_progeny(organism = "human", top = 500)
+
+sample_acts <- decoupleR::run_mlm(
+	mat = mat_df,
+	net = net_progeny,
+	.source = "source",
+	.target = "target",
+	.mor = "weight",
+	minsize = 5
+)
+
+sample_acts_mat <- sample_acts %>%
+	dplyr::select(-statistic, -p_value) %>%
+	pivot_wider(id_cols = "condition", names_from = "source", values_from = "score") %>%
+	column_to_rownames("condition") %>%
+	as.matrix()
+
+sample_acts_mat_df <- meta_data %>%
+	dplyr::select(-File) %>%
+	left_join(
+		sample_acts_mat %>%
+			as.data.frame() %>%
+			rownames_to_column("sampleid"),
+		by = "sampleid"
+	)
+
+cor_matrix <- cor(sample_acts_mat, method = "spearman")
+
+sample_acts_mat_heatmap <- pheatmap(
+      cor_matrix,
+	cutree_cols = 6,
+	cutree_rows = 6,
+	main = "Spearman correlation of PROGENy pathway activities"
+)
+
+# pdf("figures/sample_acts_mat_heatmap.pdf", width = 7, height = 6)
+# sample_acts_mat_heatmap
+# dev.off()
+```
+
+```{r}
+#| echo: false
+datatable(sample_acts_mat_df, 
+          caption = "Table 23. Predicted activity scores of PROGENy signalling pathways for each sample.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+[Figure 26](figures/sample_acts_mat_heatmap.pdf)
+
+```{r fig.width=7, fig.height=6}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 26. Spearman correlation heatmap of PROGENy signalling pathway activity scores."
+sample_acts_mat_heatmap
+```
+
+## Correlation between PC1 and pathway activities
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+pca_me_df <- as.data.frame(PCA.ME$x) %>%
+	rownames_to_column("sampleid") %>%
+	dplyr::select(sampleid, PC1)
+
+pathway_acts_df <- as.data.frame(sample_acts_mat) %>%
+	rownames_to_column("sampleid")
+
+combined_df <- pca_me_df %>%
+	inner_join(pathway_acts_df, by = "sampleid") %>%
+	column_to_rownames("sampleid")
+
+cor_results <- map_dfr(names(combined_df)[-1], function(pathway) {
+	test <- cor.test(combined_df$PC1, combined_df[[pathway]], method = "spearman")
+	tibble(pathway = pathway, rho = test$estimate, p.value = test$p.value)
+}) %>%
+	mutate(p.adj = p.adjust(p.value, method = "fdr")) %>%
+	arrange(desc(rho))
+
+plot_df <- combined_df %>%
+	rownames_to_column("sampleid") %>%
+	left_join(meta_data %>% dplyr::select(-File), by = "sampleid")
+
+PC1_TGFb_plot <- ggplot(plot_df, aes(PC1, TGFb, color = mutation)) +
+	geom_point() +
+	geom_smooth(method = "lm", se = TRUE, color = "black") +
+	theme_bw() +
+	scale_color_brewer(palette = "Set1") +
+	labs(title = "PC1 vs TGF‑β pathway activity", x = "PC1 (module eigengenes)", y = "TGFb activity")
+```
+
+```{r}
+#| echo: false
+datatable(plot_df, 
+          caption = "Table 24. Spearman correlations of pathway activities with the first principal component of module eigengenes.",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+```{r fig.width=5, fig.height=4}
+#| echo: false
+download_this(
+      PC1_TGFb_plot,
+      output_name = "PC1_TGFb_plot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.height=4, fig.width=5}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 27. Scatter plot of PC1 vs TGF‑β pathway activity with linear regression (Spearman ρ = 0.57, FDR‑adjusted p = 0.012)."
+PC1_TGFb_plot
+```
+
+## Pathways differentially active by mutation and place
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+pathway_activity_clean <- sample_acts_mat_df %>% dplyr::select(-c(2,5))
+
+colnames(pathway_activity_clean)[10] <- "JAK_STAT"
+
+pathway_cols <- colnames(pathway_activity_clean)[6:ncol(pathway_activity_clean)]
+
+run_anova <- function(pathway) {
+	formula <- as.formula(paste(pathway, "~ place + mutation"))
+	aov_result <- aov(formula, data = pathway_activity_clean)
+	p_val <- summary(aov_result)[[1]]$`Pr(>F)`[2]
+	tibble(pathway = pathway, p.value = p_val)
+}
+
+mixed_results <- map_dfr(pathway_cols, run_anova) %>%
+	mutate(p.adj = p.adjust(p.value, method = "fdr")) %>%
+	filter(p.adj < 0.05) %>%
+	arrange(p.adj)
+```
+
+```{r}
+#| echo: false
+datatable(mixed_results, 
+          caption = "Table 25. Significantly differentially active pathways by mutation status and differentiation site (two‑way ANOVA, FDR < 0.05).",
+          style = "bootstrap5", 
+          extensions = 'Buttons', 
+          options = list(dom = 'lBfrtip', 
+              buttons = c('csv', 'excel')))
+```
+
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+PI3K_boxplot <- ggplot(sample_acts_mat_df, aes(PI3K, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("PI3K")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+Trail_boxplot <- ggplot(sample_acts_mat_df, aes(Trail, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("Trail")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+NFkB_boxplot <- ggplot(sample_acts_mat_df, aes(NFkB, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("NFkB")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+TNFa_boxplot <- ggplot(sample_acts_mat_df, aes(TNFa, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("TNFa")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+MAPK_boxplot <- ggplot(sample_acts_mat_df, aes(MAPK, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("MAPK")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+Hypoxia_boxplot <- ggplot(sample_acts_mat_df, aes(Hypoxia, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("Hypoxia")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+p53_boxplot <- ggplot(sample_acts_mat_df, aes(p53, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("p53")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+JAK_STAT_boxplot <- ggplot(sample_acts_mat_df, aes(`JAK-STAT`, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("JAK-STAT")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+
+WNT_boxplot <- ggplot(sample_acts_mat_df, aes(WNT, mutation, col = mutation))+
+      stat_halfeye()+
+      xlab("Activity score")+
+      ylab("Mutation")+
+      ggtitle("WNT")+
+      theme_pubr()+
+      theme(legend.position = "none")+
+      scale_color_brewer(palette = "Set1")
+```
+
+### PI3K
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      PI3K_boxplot,
+      output_name = "PI3K_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 28. Predicted PI3K pathway activity scores by mutation status."
+PI3K_boxplot
+```
+
+```{r}
+#| echo: false
+PI3K_mmodel <- glm(PI3K ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(PI3K_mmodel)
+```
+
+### Trail
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      Trail_boxplot,
+      output_name = "Trail_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 29. Predicted Trail pathway activity scores by mutation status."
+Trail_boxplot
+```
+
+```{r}
+#| echo: false
+Trail_mmodel <- glm(Trail ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(Trail_mmodel)
+```
+
+### NFkB
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      NFkB_boxplot,
+      output_name = "NFkB_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 30. Predicted NF‑κB pathway activity scores by mutation status."
+NFkB_boxplot
+```
+
+```{r}
+#| echo: false
+NFkB_mmodel <- glm(NFkB ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(NFkB_mmodel)
+```
+
+### TNFa
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      TNFa_boxplot,
+      output_name = "TNFa_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 31. Predicted TNF‑α pathway activity scores by mutation status."
+TNFa_boxplot
+```
+
+```{r}
+#| echo: false
+TNFa_mmodel <- glm(TNFa ~  mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(TNFa_mmodel)
+```
+
+### MAPK
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      MAPK_boxplot,
+      output_name = "MAPK_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 32. Predicted MAPK pathway activity scores by mutation status."
+MAPK_boxplot
+```
+
+```{r}
+#| echo: false
+MAPK_mmodel <- glm(MAPK ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(MAPK_mmodel)
+```
+
+### Hypoxia
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      Hypoxia_boxplot,
+      output_name = "Hypoxia_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 33. Predicted hypoxia pathway activity scores by mutation status."
+Hypoxia_boxplot
+```
+
+```{r}
+#| echo: false
+Hypoxia_mmodel <- glm(Hypoxia ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(Hypoxia_mmodel)
+```
+
+### p53
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      p53_boxplot,
+      output_name = "p53_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 34. Predicted p53 pathway activity scores by mutation status."
+p53_boxplot
+```
+
+```{r}
+#| echo: false
+p53_mmodel <- glm(p53 ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(p53_mmodel)
+```
+
+### JAK-STAT
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      JAK_STAT_boxplot,
+      output_name = "JAK_STAT_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 35. Predicted JAK‑STAT pathway activity scores by mutation status."
+JAK_STAT_boxplot
+```
+
+```{r}
+#| echo: false
+JAK_STAT_mmodel <- glm(`JAK-STAT` ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(JAK_STAT_mmodel)
+```
+
+### WNT
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+download_this(
+      WNT_boxplot,
+      output_name = "WNT_boxplot",
+      output_extension = ".pdf",
+      button_label = "PDF",
+      button_type = "primary"
+)
+```
+
+```{r fig.width=4.5, fig.height=4}
+#| echo: false
+#| fig-cap: "Figure 36. Predicted WNT pathway activity scores by mutation status."
+WNT_boxplot
+```
+
+```{r}
+#| echo: false
+WNT_mmodel <- glm(WNT ~ mutation + gender + reprogramming + place, data = sample_acts_mat_df)
+summary(WNT_mmodel)
+```
+
+# Correlations between modules
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+MEs.pearson <- net.p$MEs
+MEs.spearman <- net.s$MEs
+
+MEs.pearson.sbs <- MEs.pearson[colnames(MEs.pearson) %in% paste0("ME", c(cor_sets_pearson, "skyblue3", "black", "grey"))]
+MEs.spearman.sbs <- MEs.spearman[colnames(MEs.spearman) %in% paste0("ME", c(cor_sets_spearman, "skyblue3"))]
+
+colnames(MEs.pearson.sbs) <- sub("ME", "", colnames(MEs.pearson.sbs))
+colnames(MEs.spearman.sbs) <- sub("ME", "", colnames(MEs.spearman.sbs))
+
+colnames(MEs.pearson.sbs) <- paste0("pearson_", colnames(MEs.pearson.sbs))
+colnames(MEs.spearman.sbs) <- paste0("spearman_", colnames(MEs.spearman.sbs))
+
+MEs.df <- cbind(MEs.pearson.sbs, MEs.spearman.sbs)
+
+cor_matrix <- cor(MEs.df, method = "spearman")
+
+calculate_pvalues <- function(df) {
+	n <- ncol(df)
+	p_mat <- matrix(1, n, n)
+	
+	for (i in 1:(n-1)) {
+		for (j in (i+1):n) {
+			test <- cor.test(df[, i], df[, j], method = "spearman", exact = FALSE)
+			p_mat[i, j] <- p_mat[j, i] <- test$p.value
+		}
+	}
+	
+	diag(p_mat) <- 0
+	rownames(p_mat) <- colnames(p_mat) <- colnames(df)
+	return(p_mat)
+}
+
+p_matrix <- calculate_pvalues(MEs.df)
+
+formatted_matrix <- matrix(sprintf("%.2f", cor_matrix), nrow = nrow(cor_matrix))
+
+stars_matrix <- matrix("", nrow = nrow(p_matrix), ncol = ncol(p_matrix))
+stars_matrix[p_matrix < 0.001] <- "***"
+stars_matrix[p_matrix < 0.01 & p_matrix >= 0.001] <- "**"
+stars_matrix[p_matrix < 0.05 & p_matrix >= 0.01] <- "*"
+
+display_matrix <- matrix(paste0(formatted_matrix, "\n", stars_matrix), nrow = nrow(cor_matrix))
+
+diag(display_matrix) <- sprintf("%.2f", diag(cor_matrix))
+
+rownames(display_matrix) <- colnames(display_matrix) <- colnames(MEs.df)
+
+group_dict <- c(
+	"spearman_grey" = "St. Petersburg", "spearman_orange" = "St. Petersburg", "spearman_midnightblue" = "St. Petersburg",
+	"pearson_lightcyan1" = "St. Petersburg", "pearson_cyan" = "St. Petersburg", "pearson_orangered4" = "St. Petersburg",
+	
+	"pearson_darkturquoise" = "Moscow", "pearson_grey60" = "Moscow", "pearson_violet" = "Moscow",
+	"spearman_lightsteelblue1" = "Moscow",
+	
+	"pearson_skyblue3" = "PD", "pearson_black" = "PD", "pearson_grey" = "PD", "spearman_skyblue3" = "PD"
+)
+
+col_groups <- sapply(colnames(MEs.df), function(colname) {
+	if (colname %in% names(group_dict)) group_dict[colname] else NA
+})
+
+annotation_df <- data.frame(group = factor(col_groups, levels = c("St. Petersburg", "Moscow", "PD")))
+rownames(annotation_df) <- colnames(MEs.df)
+
+group_colors <- c("Moscow" = "darkred", "St. Petersburg" = "darkblue", "PD" = "darkgreen")
+
+heatmap_modules <- pheatmap::pheatmap(
+	cor_matrix,
+	color = colorRampPalette(c("blue", "white", "red"))(100),
+	display_numbers = display_matrix,
+	number_color = "black",
+	fontsize_number = 8,
+	cluster_rows = TRUE,
+	cluster_cols = TRUE,
+	cutree_rows = 5,
+	cutree_cols = 5,
+	annotation_row = annotation_df,
+	annotation_col = annotation_df,
+	annotation_colors = list(group = group_colors)
+)
+
+# pdf("figures/heatmap_modules.pdf", width = 10, height = 8)
+# heatmap_modules
+# dev.off()
+```
+
+[Figure 37](figures/heatmap_modules.pdf)
+
+```{r fig.width=10, fig.height=8}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 37. Cross‑correlation heatmap of module eigengenes (Spearman) with significance stars."
+heatmap_modules
+```
+
+# Correlations between modules and pathways
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+me_df <- as.data.frame(MEs.df)
+if (!"sampleid" %in% colnames(me_df)) {
+	me_common <- me_df
+} else {
+	rownames(me_df) <- me_df$sampleid
+	me_common <- me_df[, !colnames(me_df) %in% "sampleid", drop = FALSE]
+}
+
+acts_df <- as.data.frame(sample_acts_mat)
+if (!"sampleid" %in% colnames(acts_df)) {
+	acts_common <- acts_df
+} else {
+	rownames(acts_df) <- acts_df$sampleid
+	acts_common <- acts_df[, !colnames(acts_df) %in% "sampleid", drop = FALSE]
+}
+
+common_samples <- intersect(rownames(me_common), rownames(acts_common))
+me_common <- me_common[common_samples, , drop = FALSE]
+acts_common <- acts_common[common_samples, , drop = FALSE]
+
+cor_me_path <- cor(me_common, acts_common, method = "spearman")
+
+n_mod <- ncol(me_common)
+n_path <- ncol(acts_common)
+p_matrix_me_path <- matrix(1, n_mod, n_path)
+rownames(p_matrix_me_path) <- colnames(me_common)
+colnames(p_matrix_me_path) <- colnames(acts_common)
+
+for (i in 1:n_mod) {
+	for (j in 1:n_path) {
+		test <- cor.test(me_common[, i], acts_common[, j], method = "spearman", exact = FALSE)
+		p_matrix_me_path[i, j] <- test$p.value
+	}
+}
+
+formatted_matrix <- matrix(sprintf("%.2f", cor_me_path), nrow = nrow(cor_me_path))
+stars_matrix <- matrix("", nrow = nrow(p_matrix_me_path), ncol = ncol(p_matrix_me_path))
+stars_matrix[p_matrix_me_path < 0.001] <- "***"
+stars_matrix[p_matrix_me_path < 0.01 & p_matrix_me_path >= 0.001] <- "**"
+stars_matrix[p_matrix_me_path < 0.05 & p_matrix_me_path >= 0.01] <- "*"
+display_matrix <- matrix(paste0(formatted_matrix, "\n", stars_matrix), nrow = nrow(cor_me_path))
+rownames(display_matrix) <- rownames(cor_me_path)
+colnames(display_matrix) <- colnames(cor_me_path)
+
+row_annotation <- annotation_df[rownames(cor_me_path), , drop = FALSE]
+
+group_colors <- c("Moscow" = "darkred", "St. Petersburg" = "darkblue", "PD" = "darkgreen")
+
+heatmap_me_path <- pheatmap::pheatmap(
+	t(cor_me_path),
+	color = colorRampPalette(c("blue", "white", "red"))(100),
+	display_numbers = t(display_matrix),
+	number_color = "black",
+	fontsize_number = 6,
+	cluster_rows = TRUE,
+	cluster_cols = TRUE,
+	annotation_col = row_annotation,
+	annotation_colors = list(group = group_colors),
+	cutree_cols = 3
+)
+
+# pdf("figures/heatmap_me_path.pdf", width = 8.5, height = 7)
+# heatmap_me_path
+# dev.off()
+```
+
+[Figure 38](figures/heatmap_me_path.pdf)
+
+```{r fig.width=8.5, fig.height=7}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 38. Heatmap of Spearman correlations between module eigengenes and PROGENy pathway activities."
+heatmap_me_path
+```
