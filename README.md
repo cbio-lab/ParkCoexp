@@ -30,4 +30,4 @@ Raw data: NCBI BioProject [PRJNA1346308](https://www.ncbi.nlm.nih.gov/bioproject
 DOI: (to be added after publication)
 
 ## License
-MIT
+All code is released under the **MIT License**. See `LICENSE` file in each sub‑repository.
