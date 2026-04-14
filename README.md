@@ -2,6 +2,8 @@
 
 Weighted gene co‑expression network construction (WGCNA‑style via BioNERO) integrated with pathway activity inference (PROGENy).
 
+🔗 **Access the full study report:** [Quarto report](http://download.ripcm.com/PARK2023/ParkCoexp/co-expression.html)
+
 ## Purpose
 - Batch effect removal between laboratories (Moscow / St. Petersburg)
 - Construction of signed hybrid networks (Pearson and Spearman correlations)
@@ -14,7 +16,7 @@ Weighted gene co‑expression network construction (WGCNA‑style via BioNERO) i
 
 ## Requirements
 - R (≥4.2)
-- Packages: `BioNERO`, `decoupleR`, `PROGENy`, `pheatmap`, `factoextra`, `igraph`
+- Packages: `decoupleR`, `dplyr`, `tibble`, `tidyr`, `purrr`, `stringr`, `ggplot2`, `pheatmap`, `vegan`, `pairwiseAdonis`, `DESeq2`, `limma`, `BioNERO`, `factoextra`, `ggpubr`, `ggdist`, `multcomp`, `RColorBrewer`, `DT`, `downloadthis`
 
 ## How to run
 1. Clone the repository
